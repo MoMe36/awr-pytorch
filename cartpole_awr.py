@@ -6,6 +6,8 @@ from torch.multiprocessing import Process
 
 from model import *
 
+from torch.utils.tensorboard import SummaryWriter
+import glob 
 
 class RLEnv(Process):
     def __init__(self, env_id, is_render):
@@ -51,6 +53,9 @@ class RLEnv(Process):
 
         return obs, reward, done, info
 
+    def get_mean_reward(self): 
+        return np.mean(self.recent_rlist)
+
     def reset(self):
         self.steps = 0
         self.episode += 1
@@ -82,7 +87,7 @@ class ActorAgent(object):
         self.actor_optimizer = optim.SGD(self.model.actor.parameters(),
                                          0.00005, momentum=0.9)
         self.critic_optimizer = optim.SGD(self.model.critic.parameters(),
-                                          0.001, momentum=0.9)
+                                          0.0001, momentum=0.9)
         self.device = torch.device('cuda' if use_cuda else 'cpu')
         self.model = self.model.to(self.device)
 
@@ -96,7 +101,7 @@ class ActorAgent(object):
             action = policy.sample().numpy().reshape(-1)
         else: 
             policy = F.softmax(policy, dim=-1).data.cpu().numpy()
-            action = np.random.choice(np.arange(self.output_size), p=policy)
+            action = np.random.choice(np.arange(self.output_size), p=policy.reshape(-1))
 
         return action
 
@@ -109,32 +114,51 @@ class ActorAgent(object):
         data_len = len(s_batch)
         mse = nn.MSELoss()
 
+
+        avg_critic_loss = 0.
+        avg_actor_loss = 0.
+
         # update critic
         self.critic_optimizer.zero_grad()
         cur_value = self.model.critic(torch.FloatTensor(s_batch))
-        print('Before opt - Value has nan: {}'.format(torch.sum(torch.isnan(cur_value))))
+        # print('Before opt - Value has nan: {}'.format(torch.sum(torch.isnan(cur_value))))
         discounted_reward, _ = discount_return(reward_batch, done_batch, cur_value.cpu().detach().numpy())
         discounted_reward = (discounted_reward - discounted_reward.mean())/(discounted_reward.std() + 1e-8)
-        for _ in range(critic_update_iter):
+
+        for critic_iter in range(critic_update_iter):
             sample_idx = random.sample(range(data_len), 256)
             sample_value = self.model.critic(torch.FloatTensor(s_batch[sample_idx]))
+            
             if(torch.sum(torch.isnan(sample_value)) > 0): 
                 print('NaN in value prediction')
                 input()
+            
             critic_loss = mse(sample_value.squeeze(), torch.FloatTensor(discounted_reward[sample_idx]))
             critic_loss.backward()
             self.critic_optimizer.step()
             self.critic_optimizer.zero_grad()
 
+            avg_critic_loss += critic_loss.item()
+
         # update actor
         cur_value = self.model.critic(torch.FloatTensor(s_batch))
-        print('After opt - Value has nan: {}'.format(torch.sum(torch.isnan(cur_value))))
+
+        # ========= DEBUG =========
+        mean_batch_value_pred = cur_value.mean().item()
+        # ===========================
+
+
+
+        # print('After opt - Value has nan: {}'.format(torch.sum(torch.isnan(cur_value))))
         discounted_reward, adv = discount_return(reward_batch, done_batch, cur_value.cpu().detach().numpy())
-        print('Advantage has nan: {}'.format(torch.sum(torch.isnan(torch.tensor(adv).float()))))
-        print('Returns has nan: {}'.format(torch.sum(torch.isnan(torch.tensor(discounted_reward).float()))))
-        # adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        # print('Advantage has nan: {}'.format(torch.sum(torch.isnan(torch.tensor(adv).float()))))
+        # print('Returns has nan: {}'.format(torch.sum(torch.isnan(torch.tensor(discounted_reward).float()))))
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        
         self.actor_optimizer.zero_grad()
-        for _ in range(actor_update_iter):
+        
+
+        for actor_iter in range(actor_update_iter):
             sample_idx = random.sample(range(data_len), 256)
             weight = torch.tensor(np.minimum(np.exp(adv[sample_idx] / beta), max_weight)).float().reshape(-1,1)
             cur_policy = self.model.actor(torch.FloatTensor(s_batch[sample_idx]))
@@ -155,7 +179,11 @@ class ActorAgent(object):
             self.actor_optimizer.step()
             self.actor_optimizer.zero_grad()
 
-        print('Weight has nan {}'.format(torch.sum(torch.isnan(weight))))
+            avg_actor_loss += actor_loss.item()
+
+        # print('Weight has nan {}'.format(torch.sum(torch.isnan(weight))))
+
+        return avg_critic_loss/critic_iter, avg_actor_loss/actor_iter, discounted_reward, adv, mean_batch_value_pred
 
 
 def discount_return(reward, done, value):
@@ -199,7 +227,7 @@ if __name__ == '__main__':
     num_sample = 2048
     critic_update_iter = 500
     actor_update_iter = 1000
-    iteration = 100000
+    iteration = 50000
     max_replay = 50000
 
     gamma = 0.99
@@ -207,6 +235,10 @@ if __name__ == '__main__':
     beta = 1.0
     max_weight = 20.0
     use_gae = True
+
+    path = './runs/{}/'.format(env_id)
+    folders = len(glob.glob(path + "*"))
+    writer = SummaryWriter('runs/{}/{}'.format(env_id, folders))
 
     agent = ActorAgent(
         input_size,
@@ -225,20 +257,21 @@ if __name__ == '__main__':
 
     last_done_index = -1
 
-    for i in range(iteration):
+
+
+    episode = 0
+    step = 0
+
+    while episode < iteration: 
         done = False
         score = 0
 
-        step = 0
-        episode = 0
         state = env.reset()
 
-        while True:
+        while not done:
             step += 1
             action = agent.get_action(state)
-            if(torch.sum(torch.isnan(torch.tensor(action).float()))): 
-                print(action)
-                action = np.zeros_like(action)
+
             next_state, reward, done, info = env.step(action)
             states.append(np.array(state))
             actions.append(action)
@@ -246,13 +279,24 @@ if __name__ == '__main__':
             next_states.append(np.array(next_state))
             dones.append(done)
 
+            score += reward
+
             state = next_state[:]
 
             if done:
                 episode += 1
 
                 state = env.reset()
+
                 if step > num_sample:
                     step = 0
                     # train
-                    agent.train_model(states, actions, rewards, next_states, dones)
+                    loss_critic, loss_actor, returns, adv, mean_value_pred = agent.train_model(states, actions, rewards, next_states, dones)
+                    writer.add_scalar('Loss/Policy', loss_actor,episode)
+                    writer.add_scalar('Loss/Value', loss_critic,episode)
+                    writer.add_scalar('Reward', env.get_mean_reward() ,episode)
+                    writer.add_scalar('Value Pred', mean_value_pred ,episode)
+
+                    print('Returns: {} - {}'.format(returns[:10], returns[-10:]))
+                    print('Adv: {} - {}'.format(adv[:10], adv[-10:]))
+                    
