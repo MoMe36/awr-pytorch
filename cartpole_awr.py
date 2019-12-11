@@ -208,9 +208,9 @@ def discount_return(reward, done, value):
 
 if __name__ == '__main__':
     # env_id = 'CartPole-v1'
-    env_id = 'Pendulum-v0'
+    # env_id = 'Pendulum-v0'
     # env_id = 'Acrobot-v1'
-    # env_id = 'BipedalWalker-v2'
+    env_id = 'BipedalWalker-v2'
 
     env = gym.make(env_id)
 
